@@ -10,40 +10,54 @@ import zipfile
 
 
 class Config:
-    project_id: str
-    email: str
-    password: str
-    overleaf_dir: str
+    project_ids: set[str] = set()
+    email: str = ""
+    password: str = ""
     url: str = "http://localhost"
     backup_dir: str = "backups"
 
     def __init__(self):
         pattern = re.compile(
             r"""
-        (?P<project_line>^PROJECT_ID="(?P<project>[a-z0-9]*)"$)|                   # your local project id
-        (?P<email_line>^EMAIL="(?P<email>[A-Za-z0-9@.]*)"$)|                       # your local overleaf email
-        (?P<password_line>^PASSWORD="(?P<password>[A-Za-z0-9@#$%^&+=]*)"$)|        # your local overleaf password
+        (^\s*PROJECT_IDS\s*=\s*"(?P<project>[a-z0-9,]*)"\s*(\#.*)?$)|               # your local project id
+        (^\s*EMAIL\s*=\s*"(?P<email>[A-Za-z0-9@\.]*)"\s*(\#.*)?$)|                  # your local overleaf email
+        (^\s*PASSWORD\s*=\s*"(?P<password>[ A-Za-z0-9@\#\$%\^&\+=\*]*)"\s*(\#.*)?$) # your local overleaf password
         """,
             re.VERBOSE,
         )
-        self.url = "http://localhost"
+
         with open(".env") as f:
             for line in f:
-                line = re.sub(r"\s*", "", line)
                 m = pattern.match(line)
-
                 if m is None:
                     continue
 
-                match m.lastgroup:
-                    case "project_line":
-                        self.project_id = m.group("project")
-                    case "email_line":
+                groups = [k for k in m.groupdict() if m.groupdict()[k] is not None]
+                assert (
+                    len(groups) == 1
+                ), f"Error: It shouldn't match 0 or multiple named groups {groups}"
+
+                match groups[0]:
+                    case "project":
+                        self.project_ids = set(m.group("project").split(","))
+                    case "email":
                         self.email = m.group("email")
-                    case "password_line":
+                    case "password":
                         self.password = m.group("password")
                     case _:
                         pass
+        assert (
+            self.password != "" and self.email != ""
+        ), "Please provide email and password on your .env configuration"
+
+    def __str__(self) -> str:
+        return f"""
+            Config:
+                {self.email=}
+                {self.password=}
+                {self.project_ids=}
+                {self.url=}
+            """
 
 
 def find_most_recent_backup(c: Config, project_name: str) -> str | None:
@@ -59,17 +73,21 @@ def find_most_recent_backup(c: Config, project_name: str) -> str | None:
     return recent_file
 
 
-def find_project_name(s: requests.Session, c: Config) -> str | None:
+def find_projects(s: requests.Session, c: Config) -> dict[str, str]:
     r = s.get(c.url + "/project")
-    projects = re.findall(
+    projects_json_obj = re.findall(
         '<meta name="ol-prefetchedProjectsBlob" data-type="json" content="(.*?)"',
         r.text,
     )[0]
-    projects = json.loads(projects.replace("&quot;", '"'))
-    for project in projects["projects"]:
-        if project["id"] == c.project_id:
-            return project["name"]
-    return None
+    projects_json_obj = json.loads(projects_json_obj.replace("&quot;", '"'))
+
+    projects: dict[str, str] = {}
+    for project in projects_json_obj["projects"]:
+        if len(c.project_ids) == 0:
+            projects[project["id"]] = project["name"]
+        elif project["id"] in c.project_ids:
+            projects[project["id"]] = project["name"]
+    return projects
 
 
 # NOTE: checking CRCs because comparing two equivelent zips would output different values due to metadata.
@@ -86,6 +104,31 @@ def zip_cmp(old_backup: str, new_backup: str):
                 return False
 
     return True
+
+
+def backup_project(s: requests.Session, c: Config, id: str, name: str):
+    r = s.get(c.url + f"/project/{id}/download/zip")
+    if r.status_code != 200:
+        print(f"Error: Couldn't find project with {id=}")
+        return
+
+    newest_backup = find_most_recent_backup(c, name)
+
+    now = datetime.now()
+    backup_name = f"{c.backup_dir}/{name}_{now.day}-{now.month}-{now.year}-{now.hour}-{now.minute}.zip"
+    with open(
+        backup_name,
+        "bw",
+    ) as f:
+        f.write(r.content)
+
+    if newest_backup and zip_cmp(newest_backup, backup_name):
+        print(
+            f"Recent backup with name {backup_name} has the same contents of {newest_backup}. Removing {backup_name}..."
+        )
+        pathlib.Path(backup_name).unlink()
+    else:
+        print(f"Successfully created backup with name {backup_name}")
 
 
 def main() -> int:
@@ -105,32 +148,33 @@ def main() -> int:
     }
     r = s.post(c.url + "/login", data=payload)
 
-    project_name = find_project_name(s, c)
-    if project_name is None:
-        print(f"Error: Couldn't find project with id {c.project_id}")
+    if r.status_code != 200:
+        print(
+            f"Couldn't login with email {c.email} and password: {c.password}. Make sure to configure them correctly."
+        )
+        return 1
+
+    projects = find_projects(s, c)
+    if len(projects) == 0:
+        print(
+            f"Error: Couldn't find projects{f' with id {str(c.project_ids)}.' if c.project_ids is not None else '.'}"
+        )
         return 1
 
     while True:
-        newest_backup = find_most_recent_backup(c, project_name)
-        r = s.get(c.url + f"/project/{c.project_id}/download/zip")
-
-        now = datetime.now()
-        backup_name = f"{c.backup_dir}/Tese_{now.day}-{now.month}-{now.year}-{now.hour}-{now.minute}.zip"
-        with open(
-            backup_name,
-            "bw",
-        ) as f:
-            f.write(r.content)
-
-        print(f"{newest_backup=} {backup_name=}")
-        if newest_backup and zip_cmp(newest_backup, backup_name):
-            print(
-                f"Recent backup with name {backup_name} has the same contents of {newest_backup}. Removing {backup_name}..."
-            )
-            pathlib.Path(backup_name).unlink()
-        else:
-            print(f"Successfully created backup with name {backup_name}")
+        for project_id, project_name in projects.items():
+            try:
+                backup_project(s, c, project_id, project_name)
+            except Exception as e:
+                print(e)
         time.sleep(5 * 60)
+
+        # See if more projects were created. This time don't exit
+        projects = find_projects(s, c)
+        if len(projects) == 0:
+            print(
+                f"Error: Couldn't find projects{f' with id {str(c.project_ids)}.' if c.project_ids is not None else '.'}"
+            )
 
 
 if __name__ == "__main__":

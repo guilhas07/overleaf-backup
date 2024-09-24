@@ -83,9 +83,16 @@ def find_projects(s: requests.Session, c: Config) -> dict[str, str]:
 
     projects: dict[str, str] = {}
     for project in projects_json_obj["projects"]:
+        in_ids = project["id"] in c.project_ids
+        if project["trashed"]:
+            if in_ids:
+                print(
+                    f"[Warning]: Attempting to backup thrashed project with id={project['id']}"
+                )
+            continue
         if len(c.project_ids) == 0:
             projects[project["id"]] = project["name"]
-        elif project["id"] in c.project_ids:
+        elif in_ids:
             projects[project["id"]] = project["name"]
     return projects
 
